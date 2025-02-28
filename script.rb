@@ -1,24 +1,30 @@
 require 'csv'
 require 'time'
 require 'ruby-progressbar'
+require 'pathname'
 
-# Path to CSV file
-CSV_FILE = '/Users/apple/Desktop/Bulk Import Script/Topic_Importer_Data.csv'
-LOG_FILE = '/Users/apple/Desktop/Bulk Import Script/import_errors.log'
+# Configuration Constants
+LOG_FILE ||= '/Users/apple/Desktop/Bulk Import Script/import_errors.log'
+CSV_DIRECTORY ||= '/Users/apple/Desktop/Bulk Import Script/'
 
-# Function to parse date from CSV
-def parse_datetime(datetime_str)
-  return nil if datetime_str.nil? || datetime_str.strip.empty?
-  
-  begin
-    Time.strptime(datetime_str, '%d/%m/%Y %H:%M')
-  rescue ArgumentError
-    nil
-  end
+def find_latest_csv(directory)
+  csv_files = Dir.glob(File.join(directory, "*.csv"))
+  return nil if csv_files.empty?
+
+  csv_files.max_by { |file| File.mtime(file) }
 end
 
+CSV_FILE = find_latest_csv(CSV_DIRECTORY)
+
+
+# Script Constants
+TAG_SEPARATOR ||= '|'
+DEFAULT_CATEGORY_ID ||= 86
+DEFAULT_MAIN_POST_USER_EMAIL ||= 'mohasaba.net.01@gmail.com'
+DEFAULT_POST_ANSWER_USER_EMAIL ||= 'info@abdelhamidcpa.com'
+
 # Ensure tags exist before assigning to topics
-def ensure_tags_exist(tags)
+def ensure_tags_exist(tags, row_number)
   return [] if tags.nil? || tags.empty?
 
   existing_tags = Tag.where(name: tags).pluck(:name)
@@ -26,10 +32,8 @@ def ensure_tags_exist(tags)
 
   new_tags.each do |tag_name|
     tag = Tag.create(name: tag_name)
-    if tag.persisted?
-      puts "Created new tag: #{tag_name}"
-    else
-      puts "Failed to create tag: #{tag_name} - #{tag.errors.full_messages.join(', ')}"
+    if !tag.persisted?
+      log.puts "Failed to create tag: #{tag_name} at row #{row_number}"
     end
   end
 
@@ -57,30 +61,24 @@ def import_topics_from_csv(csv_file_path, log_file)
     log.puts("Import Errors - #{Time.now}\n\n")
 
     CSV.foreach(csv_file_path, headers: true, encoding: 'UTF-8').with_index(2) do |row, row_number|
+      row = row.to_h.transform_keys(&:strip)
+
       begin
         # Extract and sanitize fields
         title = row['Topic_Title']&.strip
         content = row['Topic_Main_Post']&.strip
-        creator_email = row['Topic_Main_Post_User_Email']&.strip
-        category_id = row['Topic_Category_ID']&.to_i
-        tags = row['Topic_Tags']&.split('|').map(&:strip).reject(&:empty?) || []
-        created_at = parse_datetime(row['Topic_Main_Post_DateTime']&.strip)
+        tags = row['Topic_Tags']&.split(TAG_SEPARATOR).map(&:strip).reject(&:empty?) || []
+        created_at = Time.now
 
         # Extract reply details
         post_reply = row['Topic_Post_Answer']&.strip
-        post_reply_email = row['Topic_Post_Answer_User_Email']&.strip
-        post_reply_created_at = parse_datetime(row['Topic_Post_Answer_DateTime']&.strip)
+        post_reply_created_at = Time.now
 
         # Validate required fields and log row number if skipped
         missing_fields = []
         missing_fields << "Topic_Title" if title.nil? || title.empty?
         missing_fields << "Topic_Main_Post" if content.nil? || content.empty?
-        missing_fields << "Topic_Main_Post_User_Email" if creator_email.nil? || creator_email.empty?
-        missing_fields << "Topic_Category_ID" if category_id.nil? || category_id.zero? || !Category.exists?(id: category_id)
-        missing_fields << "Topic_Main_Post_DateTime" if created_at.nil?
         missing_fields << "Topic_Post_Answer" if post_reply.nil? || post_reply.empty?
-        missing_fields << "Topic_Post_Answer_User_Email" if post_reply_email.nil? || post_reply_email.empty?
-        missing_fields << "Topic_Post_Answer_DateTime" if post_reply_created_at.nil?
 
         # Skip entire row if any field is missing
         if missing_fields.any?
@@ -88,21 +86,27 @@ def import_topics_from_csv(csv_file_path, log_file)
           next
         end
 
-        # Fetch users
-        user = find_user_by_email(creator_email)
-        reply_user = find_user_by_email(post_reply_email)
-
-        if user.nil? || reply_user.nil?
-          log.puts("Skipping row #{row_number}: User not found - #{creator_email} or #{post_reply_email}")
+        # Validate Category
+        unless Category.exists?(id: DEFAULT_CATEGORY_ID)
+          log.puts("Error: Default Category ID '#{DEFAULT_CATEGORY_ID}' does not exist.")
           next
         end
 
-        tags = ensure_tags_exist(tags)
+        # Fetch users
+        user = find_user_by_email(DEFAULT_MAIN_POST_USER_EMAIL)
+        reply_user = find_user_by_email(DEFAULT_POST_ANSWER_USER_EMAIL)
+
+        if user.nil? || reply_user.nil?
+          log.puts("Skipping row #{row_number}: User not found - #{DEFAULT_MAIN_POST_USER_EMAIL} or #{DEFAULT_POST_ANSWER_USER_EMAIL}")
+          next
+        end
+
+        tags = ensure_tags_exist(tags, row_number)
 
         topic_options = {
           title: title,
           raw: content,
-          category: category_id,
+          category: DEFAULT_CATEGORY_ID,
           tags: tags,
           created_at: created_at,
           import_mode: true,
@@ -111,7 +115,7 @@ def import_topics_from_csv(csv_file_path, log_file)
         topic = TopicCreator.create(user, Guardian.new(user), topic_options)
 
         if !topic.persisted?
-          log.puts("Skipping row #{row_number}: Failed to create topic '#{title}'")
+          log.puts("Skipping row #{row_number}: Failed to create topic '#{title}' - Errors: #{topic.errors.full_messages.join(', ')}")
           next
         end
 
@@ -124,7 +128,7 @@ def import_topics_from_csv(csv_file_path, log_file)
         })
 
         if !post.persisted?
-          log.puts("Skipping row #{row_number}: Failed to create main post for topic '#{title}'")
+          log.puts("Skipping row #{row_number}: Failed to create main post for topic '#{title}' - Errors: #{post.errors.full_messages.join(', ')}")
           topic.destroy
           next
         end
@@ -139,6 +143,7 @@ def import_topics_from_csv(csv_file_path, log_file)
           log.puts("Skipping row #{row_number}: Failed to add reply to topic '#{title}'")
           topic.destroy
           post.destroy
+          topic.tags.each(&:destroy) 
           next
         end
 
@@ -152,16 +157,18 @@ def import_topics_from_csv(csv_file_path, log_file)
     end
   end
 
-  puts "\nImport Completed: #{success_count}/#{total_rows} rows successfully imported."
+  Rails.logger.info("\nImport Completed: #{success_count}/#{total_rows} rows successfully imported.")
 end
 
-Rails.logger.info("Starting topic import from CSV...")
+Rails.logger.info("Starting topic import from #{CSV_FILE} file")
 
 previous_log_level = Rails.logger.level
 Rails.logger.level = Logger::FATAL
 
 begin
   RateLimiter.disable
+  headers = CSV.foreach(CSV_FILE).first
+  puts headers
   import_topics_from_csv(CSV_FILE, LOG_FILE)
 ensure
   Rails.logger.level = previous_log_level
